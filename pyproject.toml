@@ -11,6 +11,11 @@ requires-python = ">=3.8"
 dependencies = [
     "langchain",
     "langgraph",
+    "langchain-google-genai",
+    "langchain-ollama",
+    "pydantic",
+    "tree-sitter",
+    "tree-sitter-java",
 ]
 
 [project.scripts]
