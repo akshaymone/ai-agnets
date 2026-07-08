@@ -12,88 +12,105 @@ and detects all **outbound REST API calls**, then outputs an **OpenAPI 3.1.0** s
 
 - Language scope: **Java only** (for now)
 - Parsing engine: **tree-sitter** (via `tree-sitter-java` Python binding)
-- LLM integration: **LangChain → Ollama** (local), swappable to OpenAI/Anthropic
+- LLM integration: **LangChain → LangGraph** (Ollama default, swappable to OpenAI/Anthropic/Google)
 - Output format: **OpenAPI 3.1.0 JSON**
-- Architecture: **one analyzer module per Java HTTP library**, tested independently
+- Architecture: **Agentic loop** — LLM resolves API calls by calling code lookup tools
 
 ---
 
-## ✅ MVP 1 — DONE (commit `bfb98f1`)
+## ✅ MVP 1 — DONE (commit `bfb98f1`) — SUPERSEDED by v2
 
 ### Library covered: `java.net.http.HttpClient` (Java 11+)
-
-**What is detected:**
-- HTTP method: GET, POST, PUT, DELETE, PATCH, HEAD, `.method("VERB", body)`
-- URI from `.uri(URI.create("..."))` — literal and dynamic (variable-based)
-- Headers from `.header("k","v")` and `.headers("k1","v1","k2","v2",...)`
-- Cookies parsed from the `Cookie` header value
-- Request body from `HttpRequest.BodyPublishers.ofString(...)` etc.
-- Query parameters extracted from literal URLs
-- Path parameters: exact from `{placeholder}` URLs, heuristic from dynamic URIs
-
-**Resolution statuses:**
-- `literal` — URL fully extracted as a string constant ✅
-- `dynamic` — URL built from variables; path params are heuristic guesses ⚠️
-- `llm_resolved` — LLM was used to normalize the dynamic URL ✅ (with `--llm` flag)
-
-**Patterns tested in `tests/java_samples/ApiService.java`:**
-1. Simple GET with literal URL + `Accept` header
-2. GET with dynamic URL (`baseUrl + "/users/" + userId`) + `Authorization` header
-3. GET with query params in literal URL (`?q=john&page=1&size=20`)
-4. POST with literal JSON body + `Content-Type: application/json`
-5. PUT with dynamic URL + JSON body
-6. DELETE with dynamic URL
-7. PATCH via `.method("PATCH", body)` + `Content-Type: application/json-patch+json`
-8. GET with `Cookie` header (3 cookies parsed: session, user_id, csrf_token)
-9. GET with `.headers(...)` multi-header shorthand
-10. GET with URI passed directly to `newBuilder(URI.create(...))`
-
-**Result: 10/10 patterns detected correctly.**
+**10/10 test patterns passed** — but had two key bugs:
+1. Cross-class static constants not resolved (e.g. `BASE_TENANT_URL` from `ApiConstants`)
+2. Headers sometimes missed when URL was dynamic
 
 ---
 
-## 🗂️ Module Structure
+## ✅ v2 AGENTIC REBUILD — IN PROGRESS
+
+### Architecture Decision
+Moved from static one-pass analysis to a **LangGraph-based agentic loop**:
+- LLM receives the raw builder chain + class context
+- LLM calls tools if it needs to resolve unknown symbols/constants/properties
+- Loop exits when LLM emits a final JSON block (or max hops reached)
+
+### What works (as of this session):
+- ✅ **ChainDetector** — detects all `HttpRequest.newBuilder()…build()` chains
+- ✅ **FileScanner** — collects `.java` + `.properties`/`.yml` files
+- ✅ **SymbolIndex** — pre-scans ALL Java files, indexes `static final` fields,
+  class→file mappings, and `.properties`/YAML keys
+- ✅ **LangGraph ResolverGraph** — `resolver_node` ↔ `tools_node` loop with hop limit
+- ✅ **Tools**: `lookup_symbol`, `get_class_source`, `lookup_property`
+- ✅ **ResolverAgent** — sync + async `resolve_all` / `resolve_all_async`
+- ✅ **LLM client** — provider-agnostic factory (Ollama/OpenAI/Anthropic/Google)
+- ✅ **Main CLI** — rebuilt, 5-step pipeline
+- ✅ **Full import and detection smoke test passing** (14 chains detected correctly)
+
+### What's pending:
+- [ ] Run full end-to-end test with Ollama running (`qwen2.5-coder`)
+- [ ] Validate OpenAPI output quality for cross-class constant scenarios
+- [ ] Add `ResolutionStatus.PARTIAL` and `PROPERTIES_RESOLVED` status values
+- [ ] Formal pytest test suite
+- [ ] Git commit of v2 rebuild
+
+---
+
+## 🗂️ Module Structure (v2)
 
 ```
 src/ai_agents/
-├── main.py                              # CLI: analyze-apis
-├── models/api_call.py                  # Pydantic ApiCall + ResolutionStatus
-├── parsers/java_parser.py              # tree-sitter Java wrapper
-├── analyzers/
-│   ├── base.py                         # BaseAnalyzer ABC
-│   └── java_net_http/analyzer.py       # MVP 1 ← DONE
-├── llm/client.py                       # LangChain LLM (Ollama default)
-├── output/openapi.py                   # OpenAPI 3.1.0 generator
-└── utils/file_scanner.py               # .java file scanner
+├── main.py                              # CLI: analyze-apis (v2 agentic)
+├── models/api_call.py                  # Pydantic ApiCall + ResolutionStatus (unchanged)
+├── parsers/java_parser.py              # tree-sitter Java wrapper (unchanged)
+├── scanner/
+│   ├── file_scanner.py                 # Collect .java + .properties files
+│   └── chain_detector.py               # tree-sitter chain detection → RawChain
+├── index/
+│   └── symbol_index.py                 # SymbolIndex + SymbolIndexBuilder
+├── agents/
+│   ├── tools/
+│   │   └── resolver_tools.py           # @tool: lookup_symbol, get_class_source, lookup_property
+│   ├── graph.py                        # LangGraph StateGraph (resolver ↔ tools loop)
+│   └── resolver_agent.py              # Public interface: resolve(chain) → ApiCall
+├── llm/client.py                       # Provider factory (Ollama/OpenAI/Anthropic/Google)
+└── output/openapi.py                   # OpenAPI 3.1.0 generator (unchanged)
 ```
 
 ---
 
-## 🚀 CLI Usage
+## 🚀 CLI Usage (v2)
 
 ```bash
-# Basic scan
+# Default (Ollama + qwen2.5-coder)
 analyze-apis /path/to/java/project
 
 # Save to file
 analyze-apis /path/to/java/project -o openapi.json
 
-# With LLM (Ollama running locally)
-analyze-apis /path/to/java/project --llm --llm-model llama3.2
+# Different LLM provider/model
+analyze-apis /path/to/project --llm-provider openai --llm-model gpt-4o
+analyze-apis /path/to/project --llm-provider anthropic --llm-model claude-3-5-sonnet-20241022
+
+# More hops (for complex cross-file resolution)
+analyze-apis /path/to/project --max-hops 8
+
+# Parallel resolution (faster for large codebases)
+analyze-apis /path/to/project --async
 
 # Verbose
-analyze-apis /path/to/java/project -v
+analyze-apis /path/to/project -v
 ```
 
 ---
 
 ## 🔮 Next Steps (in priority order)
 
-### Immediate (post-MVP-1 testing feedback)
-- [ ] Fix `/{baseUrl}/users/{userId}` → LLM should strip class-level base URL variables
-- [ ] Handle `String.format("https://api.example.com/%s/orders/%s", userId, orderId)`
-- [ ] Handle `sendAsync()` (same patterns, different call site)
-- [ ] Handle builder stored in a variable (multi-statement, not fluent chain)
+### Immediate
+- [ ] Run with Ollama live to validate end-to-end JSON output quality
+- [ ] Test `BASE_TENANT_URL` scenario resolves to full URL in OpenAPI output
+- [ ] Add `ResolutionStatus.PARTIAL` for partial resolutions
+- [ ] Write pytest suite for SymbolIndex + ChainDetector
 
 ### Next Libraries (MVP 2+)
 - [ ] **RestTemplate** (Spring) — `restTemplate.getForObject(url, ...)`, `exchange(...)`
@@ -104,24 +121,25 @@ analyze-apis /path/to/java/project -v
 - [ ] **Retrofit** — `@GET("/path")` interface annotations
 
 ### Future / Phase 2
-- [ ] `.properties` / `.yml` file scanning for URL values
-- [ ] `@Value("${api.base-url}")` injection tracking
-- [ ] Merge multiple calls to same endpoint intelligently
+- [ ] `@Value("${api.base-url}")` injection tracking (properties lookup tool handles this already)
+- [ ] Multi-library support (one agent per library type)
 - [ ] YAML output format option
-- [ ] pytest test suite
+- [ ] Merge multiple calls to same endpoint intelligently
 
 ---
 
-## 🧠 Key Design Decisions Made
+## 🧠 Key Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| One analyzer per library | Isolate complexity; test each library fully before next |
-| tree-sitter AST (not regex) | Handles all code styles, indentation, multiline chains |
-| LLM is optional (`--llm` flag) | Works without Ollama; LLM only for dynamic URL resolution |
-| LangChain for LLM | Provider-agnostic; swap Ollama → OpenAI with one param change |
-| OpenAPI 3.1.0 as output | Standard format, usable in Swagger UI / Postman / etc. |
-| `ResolutionStatus` enum | Communicates confidence level of each detected URL |
+| LangGraph for orchestration | Native loop/cycle support, stateful, best for ReAct agents |
+| SymbolIndex pre-built (not lazy) | Zero I/O during the agentic loop — all lookups are instant dict lookups |
+| Same-file first → whole-project fallback | Efficient; avoids false matches on common names |
+| Tools are closures over SymbolIndex | LangChain @tool must be pure functions; index injected via closure |
+| LLM outputs structured JSON | Structured final response is more reliable than parsing free text |
+| Graceful fallback on LLM failure | Always emits an ApiCall (UNRESOLVED) — never crashes or skips silently |
+| Provider-agnostic LLM client | Lazy imports — only install the package for the provider you use |
+| LLM always required (no static mode) | Simplifies codebase; static analysis alone was too limited |
 
 ---
 
@@ -129,4 +147,6 @@ analyze-apis /path/to/java/project -v
 
 | Date | What happened |
 |------|--------------|
-| 2026-07-08 | MVP 1 built and committed. `java.net.http.HttpClient` analyzer working. 10/10 test patterns pass. Pushed to `akshaymone/ai-agnets` main branch. |
+| 2026-07-08 | MVP 1 built and committed. `java.net.http.HttpClient` analyzer working. 10/10 test patterns pass. |
+| 2026-07-08 | User tested on real Java code. Found: cross-class constants not resolved, headers missing on dynamic URLs. |
+| 2026-07-08 | v2 agentic rebuild completed. LangGraph loop + SymbolIndex + provider-agnostic LLM. 14 chains detected correctly. Pending: live Ollama test. |
