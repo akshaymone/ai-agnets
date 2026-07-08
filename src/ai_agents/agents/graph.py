@@ -221,7 +221,13 @@ def extract_result(state: ResolverState) -> Optional[ApiCall]:
     except ValueError:
         status = ResolutionStatus.UNRESOLVED
 
-    url = data.get("url", "")
+    url = data.get("url") or ""
+    # If the LLM returned an empty URL, fall back to the raw expression from
+    # the source so the call is never silently dropped by the OpenAPI generator.
+    if not url:
+        url = chain.raw_uri_expr or ""
+        if status not in (ResolutionStatus.UNRESOLVED,):
+            status = ResolutionStatus.UNRESOLVED
     url_template = data.get("url_template") or _extract_path(url)
 
     # Coerce None → correct default types for dict/list fields so that Pydantic

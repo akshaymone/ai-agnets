@@ -54,9 +54,26 @@ class OpenAPIGenerator:
 
         for call in api_calls:
             path = call.url_template or call.url
+
+            # Build a visible placeholder so the call is never silently dropped.
+            # Paths like "/unresolved/endpoint" are clearly unresolved and can
+            # be fixed manually — invisible drops are much worse.
             if not path:
-                logger.warning("Skipping call with no path: %s", call)
-                continue
+                raw_expr = (call.raw_url_expression or "").strip()
+                if raw_expr:
+                    # Turn the raw expression into a safe path segment
+                    safe = (
+                        raw_expr.replace('"', "").replace(" ", "")
+                        .replace("+", "_").replace("/", "_")[:40]
+                    )
+                    path = f"/unresolved/{safe}"
+                else:
+                    path = f"/unresolved/line-{call.source_line}"
+                logger.warning(
+                    "[OpenAPIGenerator] No URL resolved for call at %s:%d — "
+                    "placing under placeholder path %s",
+                    call.source_file, call.source_line, path,
+                )
 
             # Ensure the path starts with /
             if not path.startswith("/") and not path.startswith("http"):
