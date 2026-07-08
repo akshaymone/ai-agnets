@@ -44,6 +44,7 @@ class RawChain:
     chain_text: str                 # The builder chain source text
     class_name: str                 # Enclosing Java class name
     class_body: str                 # Full body of the enclosing class (for LLM)
+    method_context: str             # Full body of the enclosing method (for LLM)
     imports: List[str]              # Import statements from the file
     package: str                    # Package declaration (for cross-file lookup)
 
@@ -131,6 +132,9 @@ class ChainDetector:
         # Find enclosing class
         class_name, class_body = _find_enclosing_class(build_node, source)
 
+        # Find enclosing method — gives the LLM local variable context
+        method_context = _find_enclosing_method(build_node, source)
+
         # Quick pre-extraction hints (no resolution — just text mining)
         raw_uri_expr = _hint_uri_expr(chain_text)
         suspected_method = _hint_http_method(chain_text)
@@ -141,6 +145,7 @@ class ChainDetector:
             chain_text=chain_text,
             class_name=class_name,
             class_body=class_body,
+            method_context=method_context,
             imports=imports,
             package=package,
             raw_uri_expr=raw_uri_expr,
@@ -187,6 +192,24 @@ def _find_enclosing_class(node: Node, source: bytes) -> Tuple[str, str]:
             return class_name, class_body
         current = current.parent
     return "<unknown>", ""
+
+
+def _find_enclosing_method(node: Node, source: bytes) -> str:
+    """
+    Walk up the AST to find the enclosing method_declaration and return its
+    full source text.  This gives the LLM the local variable assignments that
+    appear *above* the builder chain inside the same method — critical for
+    tracing variables like `endpoint`, `fullUrl`, `resourcePath`, etc.
+    Returns an empty string if no enclosing method is found.
+    """
+    current = node.parent
+    while current is not None:
+        if current.type in ("method_declaration", "constructor_declaration"):
+            return source[current.start_byte: current.end_byte].decode(
+                "utf-8", errors="replace"
+            )
+        current = current.parent
+    return ""
 
 
 def _extract_imports(root: Node, source: bytes) -> List[str]:

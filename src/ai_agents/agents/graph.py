@@ -321,23 +321,34 @@ def _fallback_api_call(chain: RawChain, reason: str) -> ApiCall:
 
 def build_initial_state(chain: RawChain, max_hops: int = MAX_HOPS_DEFAULT) -> ResolverState:
     """Build the initial LangGraph state for a single chain."""
+
+    method_section = ""
+    if chain.method_context:
+        method_section = f"""
+=== Enclosing Method (READ THIS FIRST to trace local variables) ===
+{chain.method_context}
+"""
+
     human_content = f"""Analyze this Java HttpClient builder chain and resolve the full API call.
 
 File: {chain.file}
 Line: {chain.line}
 Class: {chain.class_name}
-
-=== Builder Chain ===
+{method_section}
+=== Builder Chain (the HttpRequest built inside the method above) ===
 {chain.chain_text}
 
-=== Full Class Context ===
+=== Full Class Context (for field/constant lookups) ===
 {chain.class_body[:4000] if len(chain.class_body) > 4000 else chain.class_body}
 
 === Imports ===
 {chr(10).join(chain.imports[:30])}
 
-Use the available tools (lookup_symbol, get_class_source, lookup_property) if you need
-to resolve any variable references. Then respond with the JSON block.
+IMPORTANT: If the URI argument is a local variable (e.g. `endpoint`, `fullUrl`, `sTargetURL`),
+look at the Enclosing Method above to find its definition BEFORE calling lookup_symbol().
+Local variables are defined in the method body, not in the symbol index.
+Only call lookup_symbol() for class-level fields (e.g. BASE_TENANT_URL, API_HOST).
+Then respond with the JSON block.
 """
     return ResolverState(
         messages=[
