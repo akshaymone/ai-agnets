@@ -150,3 +150,4 @@ analyze-apis /path/to/project -v
 | 2026-07-08 | MVP 1 built and committed. `java.net.http.HttpClient` analyzer working. 10/10 test patterns pass. |
 | 2026-07-08 | User tested on real Java code. Found: cross-class constants not resolved, headers missing on dynamic URLs. |
 | 2026-07-08 | v2 agentic rebuild completed. LangGraph loop + SymbolIndex + provider-agnostic LLM. 14 chains detected correctly. Pending: live Ollama test. |
+| 2026-07-08 | Bug fix: (1) Pydantic `ValidationError` crash when LLM emits `null` for `query_params`/`cookies` — added `_as_dict`/`_as_list` coercion helpers in `extract_result()`. (2) Strengthened system prompt: LLM must call `lookup_symbol()` for ALL URL variables (e.g. `BASE_TENANT_URL`, `fullUrl`) before writing final answer; example JSON uses `{}` for empty objects to deter null emission. |

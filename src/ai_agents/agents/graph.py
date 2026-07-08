@@ -70,23 +70,31 @@ You are a Java API analyzer specialized in java.net.http.HttpClient code.
 Your task: analyze a Java HttpClient builder chain and extract a complete API call specification.
 
 You must determine:
-1. **Full URL** — host + path. If you see a variable (e.g. BASE_URL, API_HOST), call lookup_symbol() to get its value.
+1. **Full URL** — host + path. If you see ANY variable or constant (e.g. BASE_URL, API_HOST,
+   BASE_TENANT_URL, fullUrl, sTargetURL), you MUST call lookup_symbol() to resolve it BEFORE
+   writing your final answer. Never leave a variable name in the URL unresolved.
 2. **HTTP method** — GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS
-3. **Headers** — all headers as key→value. For dynamic values (method params like `token`), use {token} as placeholder.
+3. **Headers** — all headers as key→value. For dynamic values (method params like `token`),
+   use {token} as placeholder.
 4. **Query parameters** — from URL or code
 5. **Path parameters** — dynamic segments of the URL, represented as {paramName}
 6. **Request body** — content + content-type if present
 7. **Cookies** — parsed from Cookie header if present
 
 Rules:
-- If a symbol/variable value is unknown, call lookup_symbol() with the exact name.
+- ALWAYS call lookup_symbol() for any identifier used in the URL that is not a plain string literal.
+  This includes variables like `fullUrl`, `BASE_TENANT_URL`, `resourcePath`, etc.
 - If a value comes from @Value("${key}"), call lookup_property("key").
-- If you need the full source of a class, call get_class_source("ClassName").
-- Method parameters (like userId, token) that are NOT resolvable are represented as {paramName} placeholders — this is CORRECT, do not try to look them up.
-- Only call lookup_symbol for class-level fields/constants, not method parameters.
-- Do NOT invent values. If a value is truly unresolvable, say so explicitly.
+- If you need the full source of a class to find a field value, call get_class_source("ClassName").
+- Method parameters (like userId, token) that are NOT resolvable are represented as {paramName}
+  placeholders — this is CORRECT, do not try to look them up.
+- Only call lookup_symbol for class-level fields/constants or local variables built in the method;
+  do NOT look up method parameters (they appear in the method signature).
+- Do NOT invent values. If a value is truly unresolvable after tool lookups, say so in notes.
 
-When you have gathered all available information, respond with ONLY a JSON block in this exact format:
+When you have gathered all available information, respond with ONLY a JSON block in this exact format.
+IMPORTANT: Every array/object field below MUST be present. Use [] for empty arrays, {} for empty
+objects — NEVER use null for these fields:
 
 ```json
 {
@@ -98,7 +106,7 @@ When you have gathered all available information, respond with ONLY a JSON block
   "path_params": ["userId"],
   "query_params": {"page": "1", "size": "20"},
   "headers": {"Accept": "application/json", "Authorization": "Bearer {token}"},
-  "cookies": {"session": "abc123"},
+  "cookies": {},
   "body": null,
   "body_content_type": null,
   "resolution_status": "llm_resolved",
@@ -216,22 +224,30 @@ def extract_result(state: ResolverState) -> Optional[ApiCall]:
     url = data.get("url", "")
     url_template = data.get("url_template") or _extract_path(url)
 
+    # Coerce None → correct default types for dict/list fields so that Pydantic
+    # does not raise a ValidationError when the LLM emits explicit JSON null values.
+    def _as_dict(val) -> dict:
+        return val if isinstance(val, dict) else {}
+
+    def _as_list(val) -> list:
+        return val if isinstance(val, list) else []
+
     return ApiCall(
-        method=data.get("method", "GET").upper(),
+        method=(data.get("method") or "GET").upper(),
         url=url,
         url_template=url_template,
         resolution_status=status,
-        path_params=data.get("path_params", []),
-        query_params=data.get("query_params", {}),
-        headers=data.get("headers", {}),
-        cookies=data.get("cookies", {}),
+        path_params=_as_list(data.get("path_params")),
+        query_params=_as_dict(data.get("query_params")),
+        headers=_as_dict(data.get("headers")),
+        cookies=_as_dict(data.get("cookies")),
         body=data.get("body"),
         body_content_type=data.get("body_content_type"),
         source_file=chain.file,
         source_line=chain.line,
         library="java.net.http.HttpClient",
         raw_url_expression=chain.raw_uri_expr,
-        notes=data.get("notes", []),
+        notes=_as_list(data.get("notes")),
         llm_metadata={
             "hops": state.get("hop_count", 0),
             "class": chain.class_name,
