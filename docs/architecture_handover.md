@@ -3,7 +3,7 @@
 > **Version:** 2.0 (Agentic Rebuild)  
 > **Date:** 2026-07-08  
 > **Repository:** [akshaymone/ai-agnets](https://github.com/akshaymone/ai-agnets)  
-> **Status:** In Progress — pipeline complete, live LLM testing pending
+> **Status:** ✅ Live & tested — 4/4 real-world scenarios passing (Ollama / qwen2.5-coder)
 
 ---
 
@@ -125,7 +125,7 @@ sequenceDiagram
     participant SI as SymbolIndex
 
     Code->>CD: HttpRequest.newBuilder()...build()
-    CD->>RA: RawChain {chain_text, class_body, imports}
+    CD->>RA: RawChain {chain_text, method_context, class_body, imports}
 
     RA->>LG: build_initial_state(chain)
     Note over LG: State: messages, hop_count=0
@@ -165,6 +165,7 @@ classDiagram
         +str chain_text
         +str class_name
         +str class_body
+        +str method_context
         +list~str~ imports
         +str package
         +str raw_uri_expr
@@ -369,31 +370,51 @@ analyze-apis /path/to/project \
 
 ### What the LLM Sees (Prompt Design)
 
-The LLM receives:
-1. **System prompt** — instructions: use tools, output a specific JSON schema
-2. **Builder chain code** — the exact source of the `HttpRequest.newBuilder()...build()` call
-3. **Full class context** — up to 4,000 chars of the enclosing class (so it sees field declarations)
-4. **Import statements** — to understand cross-class references
-5. **Tool results** — injected as `ToolMessage` nodes in the conversation
+The LLM receives, **in this order**:
+1. **System prompt** — strict instructions: always call `lookup_symbol()` for any URL variable before answering; output a specific JSON schema; never emit `null` for array/dict fields
+2. **Enclosing Method body** — the full Java method that contains the builder chain *(new in v2.1)*. This is the most critical context piece: it shows local variable assignments like `String endpoint = BASE_URL + "/users/" + userId + ...` that would otherwise be invisible to the LLM
+3. **Builder chain code** — the exact source of the `HttpRequest.newBuilder()...build()` call
+4. **Full class context** — up to 4,000 chars of the enclosing class (so it sees field declarations like `static final String BASE_URL = ...`)
+5. **Import statements** — to understand cross-class references
+6. **Tool results** — injected as `ToolMessage` nodes in the conversation as the loop runs
+
+> **Why Enclosing Method first?** Local variables (e.g. `endpoint`, `fullUrl`, `resourcePath`) are defined in the method body, not in the `SymbolIndex`. If the LLM only sees `URI.create(endpoint)` without seeing `String endpoint = ...`, it guesses wrong. By placing the full method first, the LLM has the complete picture before it even looks at anything else.
 
 The LLM must respond with a strict JSON block:
 ```json
 {
   "method": "GET",
-  "url": "https://api.enterprise.com/v1/system/health",
-  "url_template": "/v1/system/health",
+  "url": "https://api.enterprise.com/v1/users/{userId}/documents",
+  "url_template": "/v1/users/{userId}/documents",
   "host": "api.enterprise.com",
   "scheme": "https",
-  "path_params": [],
-  "query_params": {},
-  "headers": { "Accept": "application/json" },
+  "path_params": ["userId"],
+  "query_params": {"filter": "{status}"},
+  "headers": { "Authorization": "Bearer token-123" },
   "cookies": {},
   "body": null,
   "body_content_type": null,
   "resolution_status": "llm_resolved",
-  "notes": []
+  "notes": ["userId and status are method parameters"]
 }
 ```
+
+> **Important:** Every array/object field must be present and non-null. The system defensively coerces any `null` the LLM emits to `[]` / `{}` before Pydantic validation.
+
+---
+
+### Robustness & Edge Cases
+
+The pipeline is designed to **never crash and never silently drop a detected call**:
+
+| Failure scenario | What happens |
+|------------------|--------------|
+| LLM emits `"query_params": null` | `_as_dict()` coercion in `extract_result()` converts to `{}` — Pydantic never sees `None` |
+| LLM emits `"url": ""` (blank) | Falls back to `chain.raw_uri_expr` — the call is never lost |
+| URL still empty after fallback | OpenAPI generator places call at `/unresolved/<raw_expr_slug>` with a `WARNING` log |
+| LLM error / network timeout | `ResolverAgent` catches exception, returns `ApiCall(resolution_status=UNRESOLVED)` with error in `notes` |
+| Max hops reached | Graph exits, `extract_result()` parses whatever the last AI message contains |
+| LLM resolves local variable to wrong method's URL | Fixed by `method_context` — enclosing method body is in the prompt, so the LLM always traces the right variable |
 
 ---
 
