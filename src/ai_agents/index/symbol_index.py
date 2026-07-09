@@ -96,51 +96,119 @@ class SymbolIndex:
         """
         Look up a symbol by name.
 
-        Strategy:
-          1. Same file first (if context_file given)
-          2. Whole index fallback
+        Strategy (in priority order):
+          1. Same file first (if context_file given) — avoids false matches
+             from identically-named constants in different classes
+          2. Same class name heuristic (context_file stem matches class name)
+          3. Prefer static final entries (most likely to be the intended constant)
+          4. First entry in the index as last resort
 
         Returns the best match, or None if not found.
         """
+        logger.debug(
+            "[SymbolIndex] lookup_symbol(name='%s', context_file='%s')",
+            name,
+            context_file or "<none>",
+        )
         entries = self._symbols.get(name)
         if not entries:
+            logger.debug(
+                "[SymbolIndex]   '%s' not in index at all (total unique names: %d)",
+                name,
+                len(self._symbols),
+            )
             return None
+
+        logger.debug(
+            "[SymbolIndex]   '%s' found in %d location(s)", name, len(entries)
+        )
+        for e in entries:
+            logger.debug(
+                "[SymbolIndex]     candidate: class=%s file=%s line=%d value='%s' "
+                "static=%s final=%s",
+                e.class_name, e.file, e.line, e.value, e.is_static, e.is_final,
+            )
 
         # Same-file priority
         if context_file:
             ctx = str(Path(context_file).resolve())
             same_file = [e for e in entries if str(Path(e.file).resolve()) == ctx]
             if same_file:
+                logger.debug(
+                    "[SymbolIndex]   Strategy 1 (same-file) → matched: class=%s value='%s'",
+                    same_file[0].class_name,
+                    same_file[0].value,
+                )
                 return same_file[0]
 
             # Same class name in the context file name (heuristic)
             ctx_stem = Path(context_file).stem
             same_class = [e for e in entries if e.class_name == ctx_stem]
             if same_class:
+                logger.debug(
+                    "[SymbolIndex]   Strategy 2 (same-class heuristic, stem='%s') → "
+                    "matched: value='%s'",
+                    ctx_stem,
+                    same_class[0].value,
+                )
                 return same_class[0]
+
+            logger.debug(
+                "[SymbolIndex]   Strategies 1+2 failed for context_file='%s'. "
+                "Falling back to global strategies.",
+                context_file,
+            )
 
         # Prefer static final entries (more likely to be the "constant" intended)
         static_finals = [e for e in entries if e.is_static and e.is_final]
         if static_finals:
+            logger.debug(
+                "[SymbolIndex]   Strategy 3 (static final) → matched: class=%s value='%s'",
+                static_finals[0].class_name,
+                static_finals[0].value,
+            )
             return static_finals[0]
 
+        logger.debug(
+            "[SymbolIndex]   Strategy 4 (first match) → class=%s value='%s'",
+            entries[0].class_name,
+            entries[0].value,
+        )
         return entries[0]
 
     def lookup_property(self, key: str) -> Optional[str]:
         """Look up a property value by key (from .properties / .yml files)."""
-        return self._properties.get(key) or self._properties.get(
+        logger.debug("[SymbolIndex] lookup_property(key='%s')", key)
+        value = self._properties.get(key) or self._properties.get(
             key.replace("-", ".").replace("_", ".")
         )
+        if value is not None:
+            logger.debug("[SymbolIndex]   Found: '%s' = '%s'", key, value)
+        else:
+            logger.debug("[SymbolIndex]   Not found: '%s'", key)
+        return value
 
     def class_file(self, class_name: str) -> Optional[str]:
         """Return the absolute file path for a given class name."""
-        return self._class_files.get(class_name)
+        path = self._class_files.get(class_name)
+        logger.debug(
+            "[SymbolIndex] class_file(class_name='%s') → %s",
+            class_name,
+            path or "<not found>",
+        )
+        return path
 
     def get_class_source(self, class_name: str) -> Optional[str]:
         """Return the full source of a Java class, or None if not found."""
+        logger.debug("[SymbolIndex] get_class_source(class_name='%s')", class_name)
         path = self.class_file(class_name)
         if path and Path(path).exists():
-            return Path(path).read_text(encoding="utf-8", errors="replace")
+            source = Path(path).read_text(encoding="utf-8", errors="replace")
+            logger.debug(
+                "[SymbolIndex]   → Read %d chars from '%s'", len(source), path
+            )
+            return source
+        logger.debug("[SymbolIndex]   → class '%s' has no file or file missing", class_name)
         return None
 
     def all_symbol_names(self) -> List[str]:
@@ -182,20 +250,45 @@ class SymbolIndexBuilder:
         """
         Scan all files and return a populated SymbolIndex.
 
+        This runs ONCE before any LLM calls. All lookups during the
+        agentic loop are instant dict lookups — no file I/O.
+
         Parameters
         ----------
         java_files   : list of .java file paths
         config_files : list of .properties / .yml paths (optional)
         """
+        logger.info(
+            "[SymbolIndex] ══════════════════════════════════════════"
+        )
+        logger.info(
+            "[SymbolIndex] BUILD START: %d Java file(s), %d config file(s)",
+            len(java_files),
+            len(config_files or []),
+        )
+        logger.info(
+            "[SymbolIndex] Goal: index all static final fields, class names, "
+            "and .properties/.yml values for instant lookup during LLM tool calls."
+        )
         index = SymbolIndex()
 
-        for jf in java_files:
+        logger.debug("[SymbolIndex] --- Indexing Java files ---")
+        for i, jf in enumerate(java_files, 1):
+            logger.debug(
+                "[SymbolIndex] [%d/%d] Indexing Java: %s",
+                i, len(java_files), jf.name,
+            )
             try:
                 self._index_java_file(jf, index)
             except Exception as exc:
                 logger.warning("[SymbolIndex] Failed to index %s: %s", jf, exc)
 
-        for cf in (config_files or []):
+        logger.debug("[SymbolIndex] --- Indexing config files ---")
+        for i, cf in enumerate(config_files or [], 1):
+            logger.debug(
+                "[SymbolIndex] [%d/%d] Indexing config: %s",
+                i, len(config_files or []), cf.name,
+            )
             try:
                 self._index_config_file(cf, index)
             except Exception as exc:
@@ -203,17 +296,53 @@ class SymbolIndexBuilder:
 
         stats = index.stats()
         logger.info(
-            "[SymbolIndex] Built: %d symbols, %d classes, %d properties",
+            "[SymbolIndex] BUILD COMPLETE: %d symbols, %d classes, %d properties",
             stats["symbols"], stats["classes"], stats["properties"],
+        )
+        logger.debug(
+            "[SymbolIndex] All indexed symbol names: %s",
+            index.all_symbol_names(),
+        )
+        logger.debug(
+            "[SymbolIndex] All indexed class names: %s",
+            sorted(index._class_files.keys()),
+        )
+        logger.debug(
+            "[SymbolIndex] All indexed property keys: %s",
+            sorted(index._properties.keys()),
+        )
+        logger.info(
+            "[SymbolIndex] ══════════════════════════════════════════"
         )
         return index
 
     # ── Java indexing ─────────────────────────────────────────────────────────
 
     def _index_java_file(self, path: Path, index: SymbolIndex) -> None:
+        """
+        Parse a single Java file and extract all classes and fields.
+
+        Uses tree-sitter to build an AST, then walks it recursively.
+        Only literal-valued fields are indexed (method call results are skipped).
+        """
+        logger.debug("[SymbolIndex] _index_java_file: parsing '%s'...", path.name)
         tree, source = self._parser.parse_file(path)
         root = tree.root_node
+        logger.debug(
+            "[SymbolIndex]   AST root type='%s', source=%d bytes",
+            root.type, len(source),
+        )
+        before_symbols = sum(len(v) for v in index._symbols.values())
+        before_classes = len(index._class_files)
         self._walk_for_classes(root, source, str(path), index)
+        after_symbols = sum(len(v) for v in index._symbols.values())
+        after_classes = len(index._class_files)
+        logger.debug(
+            "[SymbolIndex]   '%s' → added %d symbol(s), %d class(es)",
+            path.name,
+            after_symbols - before_symbols,
+            after_classes - before_classes,
+        )
 
     def _walk_for_classes(
         self,
@@ -223,11 +352,23 @@ class SymbolIndexBuilder:
         index: SymbolIndex,
         parent_class: str = "",
     ) -> None:
-        """Recursively walk AST, extracting class names and field declarations."""
+        """
+        Recursively walk AST, extracting class names and field declarations.
+
+        When we find a class/interface/enum node:
+          1. Register class_name → file_path in the class index
+          2. Walk the class body for field_declaration nodes
+          3. Recurse for nested classes
+        """
         if node.type in ("class_declaration", "interface_declaration", "enum_declaration"):
             class_name = _node_identifier(node, source) or parent_class
             if class_name:
                 index._add_class(class_name, file_path)
+                logger.debug(
+                    "[SymbolIndex]   Registered class: '%s' → %s",
+                    class_name,
+                    file_path,
+                )
             # Walk into class body for fields
             for child in node.children:
                 self._walk_for_fields(child, source, file_path, class_name, index)
@@ -246,11 +387,35 @@ class SymbolIndexBuilder:
         class_name: str,
         index: SymbolIndex,
     ) -> None:
-        """Extract field_declaration nodes and index their literal values."""
+        """
+        Extract field_declaration nodes and index their literal values.
+
+        Only fields with simple literal initializers are indexed:
+          static final String BASE_URL = "https://api.example.com";  ← indexed
+          static HttpClient client = HttpClient.newHttpClient();      ← skipped (not literal)
+        """
         if node.type == "field_declaration":
+            field_text = source[node.start_byte:node.end_byte].decode("utf-8", errors="replace").strip()
+            logger.debug(
+                "[SymbolIndex]   field_declaration in class '%s': %s",
+                class_name,
+                field_text[:100].replace("\n", " "),
+            )
             entry = _parse_field_declaration(node, source, file_path, class_name)
             if entry:
                 index._add_symbol(entry)
+                logger.debug(
+                    "[SymbolIndex]     ✓ Indexed symbol: '%s' = '%s' (type=%s, static=%s, final=%s)",
+                    entry.name,
+                    entry.value,
+                    entry.java_type,
+                    entry.is_static,
+                    entry.is_final,
+                )
+            else:
+                logger.debug(
+                    "[SymbolIndex]     ✗ Skipped (no simple literal value found)"
+                )
             return
 
         for child in node.children:
@@ -267,22 +432,49 @@ class SymbolIndexBuilder:
             self._index_yaml(path, index)
 
     def _index_properties(self, path: Path, index: SymbolIndex) -> None:
+        """
+        Parse a .properties file and add every key=value pair to the index.
+        Lines starting with # or ! are comments and are skipped.
+        """
+        logger.debug("[SymbolIndex] _index_properties: '%s'", path.name)
         text = path.read_text(encoding="utf-8", errors="replace")
+        count = 0
         for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("!"):
                 continue
             if "=" in line:
                 key, _, value = line.partition("=")
-                index._add_property(key.strip(), value.strip())
+                k, v = key.strip(), value.strip()
+                index._add_property(k, v)
+                logger.debug("[SymbolIndex]   .properties: '%s' = '%s'", k, v)
+                count += 1
             elif ":" in line:
                 key, _, value = line.partition(":")
-                index._add_property(key.strip(), value.strip())
+                k, v = key.strip(), value.strip()
+                index._add_property(k, v)
+                logger.debug("[SymbolIndex]   .properties: '%s' = '%s'", k, v)
+                count += 1
+        logger.debug(
+            "[SymbolIndex]   '%s' → indexed %d property/ies", path.name, count
+        )
 
     def _index_yaml(self, path: Path, index: SymbolIndex) -> None:
-        """Flatten YAML into dotted keys without requiring PyYAML."""
+        """
+        Flatten YAML into dotted keys without requiring PyYAML.
+
+        Example:
+            api:
+              base-url: https://example.com
+        → Indexed as: 'api.base-url' = 'https://example.com'
+
+        The indentation stack tracks nesting level so we can build
+        the full dotted key path for each leaf value.
+        """
+        logger.debug("[SymbolIndex] _index_yaml: '%s'", path.name)
         text = path.read_text(encoding="utf-8", errors="replace")
         prefix_stack: List[tuple] = []  # (indent, key_prefix)
+        count = 0
         for raw_line in text.splitlines():
             if not raw_line.strip() or raw_line.strip().startswith("#"):
                 continue
@@ -291,7 +483,11 @@ class SymbolIndexBuilder:
 
             # Pop stack for dedent
             while prefix_stack and prefix_stack[-1][0] >= indent:
-                prefix_stack.pop()
+                popped = prefix_stack.pop()
+                logger.debug(
+                    "[SymbolIndex]   YAML dedent: popped '%s' (was at indent %d)",
+                    popped[1], popped[0],
+                )
 
             if ":" in stripped:
                 key_part, _, val_part = stripped.partition(":")
@@ -302,11 +498,23 @@ class SymbolIndexBuilder:
                 full_key = f"{current_prefix}.{key_part}" if current_prefix else key_part
 
                 if val_part and not val_part.startswith("{") and not val_part.startswith("["):
-                    # Leaf value
-                    index._add_property(full_key, val_part.strip("'\""))
+                    # Leaf value — index it
+                    clean_val = val_part.strip("'\"")
+                    index._add_property(full_key, clean_val)
+                    logger.debug(
+                        "[SymbolIndex]   YAML leaf: '%s' = '%s'", full_key, clean_val
+                    )
+                    count += 1
                 else:
-                    # Nested key — push to stack
+                    # Nested key — push to stack for child resolution
                     prefix_stack.append((indent, key_part))
+                    logger.debug(
+                        "[SymbolIndex]   YAML nesting: pushing '%s' (indent=%d)",
+                        key_part, indent,
+                    )
+        logger.debug(
+            "[SymbolIndex]   '%s' → indexed %d YAML property/ies", path.name, count
+        )
 
 
 # ── AST parsing helpers ───────────────────────────────────────────────────────
